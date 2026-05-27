@@ -174,7 +174,7 @@ jobs:
           font = None
           for path in font_paths:
               try:
-                  font = ImageFont.truetype(path, 18)
+                  font = ImageFont.truetype(path, 42)
                   break
               except Exception:
                   pass
@@ -188,6 +188,7 @@ jobs:
                   if not line.strip():
                       continue
                   obj = json.loads(line)
+
                   if obj.get("page") != 1:
                       continue
 
@@ -198,7 +199,17 @@ jobs:
                   if label is None or x is None or y is None:
                       continue
 
-                  draw.text((int(x), max(0, int(y) - 12)), label, fill=(255, 0, 0), font=font)
+                  px = int(x) - 12
+                  py = max(0, int(y) - 42)
+
+                  # 白縁
+                  draw.text((px - 1, py - 1), label, fill=(255, 255, 255), font=font)
+                  draw.text((px + 1, py - 1), label, fill=(255, 255, 255), font=font)
+                  draw.text((px - 1, py + 1), label, fill=(255, 255, 255), font=font)
+                  draw.text((px + 1, py + 1), label, fill=(255, 255, 255), font=font)
+
+                  # 本体（赤）
+                  draw.text((px, py), label, fill=(255, 0, 0), font=font)
                   count += 1
 
           img.save(overlay_png)
