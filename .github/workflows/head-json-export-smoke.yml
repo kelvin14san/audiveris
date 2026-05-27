@@ -1,7 +1,7 @@
 name: Head JSON Export Smoke Test
 
 on:
-  - workflow_dispatch
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -24,7 +24,7 @@ jobs:
           file: gradle.properties
           all: true
 
-      - name: Setup Java ${{ steps.all.outputs.theMinJavaVersion }}
+      - name: Setup Java
         uses: actions/setup-java@v5
         with:
           java-version: ${{ steps.all.outputs.theMinJavaVersion }}
@@ -40,9 +40,9 @@ jobs:
           sudo apt update
           sudo apt install -y libgtk-3-0 xvfb
 
-      - name: Set environment variable(s)
+      - name: Set environment variables
         run: |
-          echo "TESSDATA_TAG=${{ steps.all.outputs.theTessdataTag }}" >> $GITHUB_ENV
+          echo "TESSDATA_TAG=${{ steps.all.outputs.theTessdataTag }}" >> "$GITHUB_ENV"
 
       - name: Get cached tessdata files
         id: cache-tessdata
@@ -59,7 +59,9 @@ jobs:
       - name: Run RunHeadJsonExport on existing sample with Xvfb
         run: |
           mkdir -p "$OUT_DIR"
-          xvfb-run -a ./gradlew :app:run -PcmdLineArgs="-batch,-transcribe,-output,$OUT_DIR,-run,org.audiveris.omr.RunHeadJsonExport,data/examples/Dichterliebe01.pdf"
+          SAMPLE_PDF="$GITHUB_WORKSPACE/data/examples/Dichterliebe01.pdf"
+          ls -l "$SAMPLE_PDF"
+          xvfb-run -a ./gradlew :app:run -PcmdLineArgs="-batch,-transcribe,-output,$OUT_DIR,-run,org.audiveris.omr.RunHeadJsonExport,$SAMPLE_PDF"
 
       - name: Locate output file
         id: locate
