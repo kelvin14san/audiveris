@@ -1,0 +1,198 @@
+name: Head JSON Export Smoke Test
+
+on:
+  - workflow_dispatch
+
+permissions:
+  contents: read
+
+jobs:
+  head-json-export-smoke:
+    runs-on: ubuntu-latest
+    env:
+      TESSDATA_PREFIX: /home/runner/.config/AudiverisLtd/audiveris/tessdata
+      OUT_DIR: /tmp/audiveris-out
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Retrieve Gradle properties
+        uses: BrycensRanch/read-properties-action@v1
+        id: all
+        with:
+          file: gradle.properties
+          all: true
+
+      - name: Setup Java ${{ steps.all.outputs.theMinJavaVersion }}
+        uses: actions/setup-java@v5
+        with:
+          java-version: ${{ steps.all.outputs.theMinJavaVersion }}
+          distribution: zulu
+
+      - name: Show Java version
+        run: |
+          java -version
+          echo "theMinJavaVersion=${{ steps.all.outputs.theMinJavaVersion }}"
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y libgtk-3-0 xvfb python3-pil
+
+      - name: Set environment variable(s)
+        run: |
+          echo "TESSDATA_TAG=${{ steps.all.outputs.theTessdataTag }}" >> $GITHUB_ENV
+
+      - name: Get cached tessdata files
+        id: cache-tessdata
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TESSDATA_PREFIX }}
+          key: ${{ runner.os }}-tessdata-${{ env.TESSDATA_TAG }}-eng
+
+      - name: Install tessdata files
+        if: steps.cache-tessdata.outputs.cache-hit != 'true'
+        run: |
+          ${GITHUB_WORKSPACE}/.github/install-tessdata.sh eng
+
+      - name: Run RunHeadJsonExport + annotate on existing sample with Xvfb
+        run: |
+          mkdir -p "$OUT_DIR"
+          # Use an absolute path from repository root in Actions workspace
+          SAMPLE_PDF="$GITHUB_WORKSPACE/data/examples/Dichterliebe01.pdf"
+          ls -l "$SAMPLE_PDF"
+          xvfb-run -a ./gradlew :app:run -PcmdLineArgs="-batch,-transcribe,-annotate,-output,$OUT_DIR,-run,org.audiveris.omr.RunHeadJsonExport,$SAMPLE_PDF"
+
+      - name: Locate output file
+        id: locate
+        run: |
+          set -euo pipefail
+          HEADS_FILE=$(find "$OUT_DIR" -type f -name '*-heads.jsonl' | head -n 1)
+          if [ -z "$HEADS_FILE" ]; then
+            echo "No heads.jsonl found under $OUT_DIR"
+            exit 1
+          fi
+          echo "heads_file=$HEADS_FILE" >> "$GITHUB_OUTPUT"
+          echo "Generated file: $HEADS_FILE"
+
+          ANN_ZIP=$(find "$OUT_DIR" -type f -name '*.annotations.zip' | head -n 1)
+          if [ -z "$ANN_ZIP" ]; then
+            echo "No annotations zip found under $OUT_DIR"
+            exit 1
+          fi
+          echo "annotations_zip=$ANN_ZIP" >> "$GITHUB_OUTPUT"
+          echo "Annotations zip: $ANN_ZIP"
+
+          WORK_DIR="$OUT_DIR/overlay-work"
+          mkdir -p "$WORK_DIR"
+          unzip -o "$ANN_ZIP" -d "$WORK_DIR" >/dev/null
+          SHEET_PNG=$(find "$WORK_DIR" -type f -name '*.png' | sort | head -n 1)
+          if [ -z "$SHEET_PNG" ]; then
+            echo "No sheet PNG found in annotations zip"
+            exit 1
+          fi
+          echo "sheet_png=$SHEET_PNG" >> "$GITHUB_OUTPUT"
+          echo "Base sheet PNG: $SHEET_PNG"
+
+      - name: Create overlay PNG from JSONL and sheet PNG (page 1)
+        id: overlay
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from PIL import Image, ImageDraw, ImageFont
+
+          heads_file = os.environ["HEADS_FILE"]
+          sheet_png = os.environ["SHEET_PNG"]
+          out_png = os.environ["OUT_PNG"]
+
+          image = Image.open(sheet_png).convert("RGB")
+          draw = ImageDraw.Draw(image)
+          font = ImageFont.load_default()
+
+          count = 0
+          with open(heads_file, encoding="utf-8") as fh:
+              for line in fh:
+                  line = line.strip()
+                  if not line:
+                      continue
+                  obj = json.loads(line)
+                  if obj.get("page") != 1:
+                      continue
+                  x = obj.get("x")
+                  y = obj.get("y")
+                  label = obj.get("label")
+                  if x is None or y is None or not label:
+                      continue
+                  draw.text((x, max(0, y - 12)), label, fill=(255, 0, 0), font=font)
+                  count += 1
+
+          image.save(out_png, format="PNG")
+          print(f"overlay_written={out_png}")
+          print(f"labels_drawn={count}")
+          PY
+        env:
+          HEADS_FILE: ${{ steps.locate.outputs.heads_file }}
+          SHEET_PNG: ${{ steps.locate.outputs.sheet_png }}
+          OUT_PNG: /tmp/audiveris-out/overlay-page1.png
+
+      - name: Show generated files for overlay experiment
+        run: |
+          echo "heads.jsonl : ${{ steps.locate.outputs.heads_file }}"
+          echo "sheet PNG   : ${{ steps.locate.outputs.sheet_png }}"
+          echo "overlay PNG : /tmp/audiveris-out/overlay-page1.png"
+
+      - name: Show first 20 lines
+        run: |
+          echo "Generated file: ${{ steps.locate.outputs.heads_file }}"
+          head -n 20 "${{ steps.locate.outputs.heads_file }}"
+
+      - name: Verify required keys
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import sys
+
+          heads_file = os.environ["HEADS_FILE"]
+          required = ["page", "x", "y", "step", "octave", "alteration", "label"]
+          checked = 0
+          missing_any = False
+
+          with open(heads_file, encoding="utf-8") as fh:
+              for line in fh:
+                  line = line.strip()
+                  if not line:
+                      continue
+                  checked += 1
+                  obj = json.loads(line)
+                  missing = [k for k in required if k not in obj]
+                  if missing:
+                      missing_any = True
+                  print(f"line={checked} missing={missing}")
+                  if checked >= 20:
+                      break
+
+          print(f"checked_lines={checked}")
+          if checked == 0:
+              print("No JSONL records found", file=sys.stderr)
+              sys.exit(1)
+          if missing_any:
+              print("Missing required keys detected", file=sys.stderr)
+              sys.exit(1)
+          print("All required keys found in inspected lines")
+          PY
+        env:
+          HEADS_FILE: ${{ steps.locate.outputs.heads_file }}
+
+      - name: Upload heads.jsonl artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: head-overlay-experiment
+          path: |
+            ${{ steps.locate.outputs.heads_file }}
+            ${{ steps.locate.outputs.sheet_png }}
+            /tmp/audiveris-out/overlay-page1.png
+          if-no-files-found: error
+          overwrite: true
