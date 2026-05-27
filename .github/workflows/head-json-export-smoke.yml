@@ -38,7 +38,7 @@ jobs:
       - name: Install runtime dependencies
         run: |
           sudo apt update
-          sudo apt install -y libgtk-3-0 xvfb
+          sudo apt install -y libgtk-3-0 xvfb unzip python3-pil fonts-noto-cjk
 
       - name: Set environment variables
         run: |
@@ -56,26 +56,59 @@ jobs:
         run: |
           ${GITHUB_WORKSPACE}/.github/install-tessdata.sh eng
 
-      - name: Run RunHeadJsonExport on existing sample with Xvfb
+      - name: Run Audiveris export and annotations
         run: |
           mkdir -p "$OUT_DIR"
           SAMPLE_PDF="$GITHUB_WORKSPACE/data/examples/Dichterliebe01.pdf"
           ls -l "$SAMPLE_PDF"
-          xvfb-run -a ./gradlew :app:run -PcmdLineArgs="-batch,-transcribe,-output,$OUT_DIR,-run,org.audiveris.omr.RunHeadJsonExport,$SAMPLE_PDF"
+          xvfb-run -a ./gradlew :app:run -PcmdLineArgs="-batch,-transcribe,-annotate,-output,$OUT_DIR,-run,org.audiveris.omr.RunHeadJsonExport,$SAMPLE_PDF"
 
-      - name: Locate output file
+      - name: Locate outputs
         id: locate
         run: |
           set -euo pipefail
+
           HEADS_FILE=$(find "$OUT_DIR" -type f -name '*-heads.jsonl' | head -n 1)
           if [ -z "$HEADS_FILE" ]; then
             echo "No heads.jsonl found under $OUT_DIR"
             exit 1
           fi
-          echo "heads_file=$HEADS_FILE" >> "$GITHUB_OUTPUT"
-          echo "Generated file: $HEADS_FILE"
 
-      - name: Show first 20 lines
+          ANNOTATION_ZIP=$(find "$OUT_DIR" -type f \( -name '*annotation*.zip' -o -name '*annotations*.zip' \) | head -n 1)
+          if [ -z "$ANNOTATION_ZIP" ]; then
+            echo "No annotation zip found under $OUT_DIR"
+            find "$OUT_DIR" -type f | sort
+            exit 1
+          fi
+
+          echo "Generated heads file: $HEADS_FILE"
+          echo "Generated annotation zip: $ANNOTATION_ZIP"
+
+          echo "heads_file=$HEADS_FILE" >> "$GITHUB_OUTPUT"
+          echo "annotation_zip=$ANNOTATION_ZIP" >> "$GITHUB_OUTPUT"
+
+      - name: Extract sheet PNG
+        id: sheet
+        run: |
+          set -euo pipefail
+
+          ANNOTATION_DIR="$OUT_DIR/annotations"
+          mkdir -p "$ANNOTATION_DIR"
+          unzip -q "${{ steps.locate.outputs.annotation_zip }}" -d "$ANNOTATION_DIR"
+
+          SHEET_PNG=$(find "$ANNOTATION_DIR" -type f -iname '*.png' | sort | head -n 1)
+          if [ -z "$SHEET_PNG" ]; then
+            echo "No PNG found in annotation zip"
+            find "$ANNOTATION_DIR" -type f | sort
+            exit 1
+          fi
+
+          cp "$SHEET_PNG" "$OUT_DIR/sheet-page1.png"
+
+          echo "Sheet PNG: $SHEET_PNG"
+          echo "sheet_png=$OUT_DIR/sheet-page1.png" >> "$GITHUB_OUTPUT"
+
+      - name: Show first 20 JSONL lines
         run: |
           echo "Generated file: ${{ steps.locate.outputs.heads_file }}"
           head -n 20 "${{ steps.locate.outputs.heads_file }}"
@@ -118,10 +151,73 @@ jobs:
         env:
           HEADS_FILE: ${{ steps.locate.outputs.heads_file }}
 
-      - name: Upload heads.jsonl artifact
+      - name: Create overlay PNG
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from PIL import Image, ImageDraw, ImageFont
+
+          heads_file = Path("${{ steps.locate.outputs.heads_file }}")
+          sheet_png = Path("${{ steps.sheet.outputs.sheet_png }}")
+          overlay_png = Path("/tmp/audiveris-out/overlay-page1.png")
+
+          img = Image.open(sheet_png).convert("RGB")
+          draw = ImageDraw.Draw(img)
+
+          font_paths = [
+              "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+              "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+              "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+          ]
+
+          font = None
+          for path in font_paths:
+              try:
+                  font = ImageFont.truetype(path, 18)
+                  break
+              except Exception:
+                  pass
+
+          if font is None:
+              font = ImageFont.load_default()
+
+          count = 0
+          with open(heads_file, encoding="utf-8") as fh:
+              for line in fh:
+                  if not line.strip():
+                      continue
+                  obj = json.loads(line)
+                  if obj.get("page") != 1:
+                      continue
+
+                  label = obj.get("label")
+                  x = obj.get("x")
+                  y = obj.get("y")
+
+                  if label is None or x is None or y is None:
+                      continue
+
+                  draw.text((int(x), max(0, int(y) - 12)), label, fill=(255, 0, 0), font=font)
+                  count += 1
+
+          img.save(overlay_png)
+          print(f"overlay_png={overlay_png}")
+          print(f"labels_drawn={count}")
+          PY
+
+      - name: Prepare artifact bundle
+        run: |
+          mkdir -p "$OUT_DIR/artifact"
+          cp "${{ steps.locate.outputs.heads_file }}" "$OUT_DIR/artifact/heads.jsonl"
+          cp "${{ steps.sheet.outputs.sheet_png }}" "$OUT_DIR/artifact/sheet-page1.png"
+          cp "$OUT_DIR/overlay-page1.png" "$OUT_DIR/artifact/overlay-page1.png"
+          ls -l "$OUT_DIR/artifact"
+
+      - name: Upload overlay experiment artifact
         uses: actions/upload-artifact@v4
         with:
-          name: heads-jsonl
-          path: ${{ steps.locate.outputs.heads_file }}
+          name: head-overlay-experiment
+          path: /tmp/audiveris-out/artifact/*
           if-no-files-found: error
           overwrite: true
